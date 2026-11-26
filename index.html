@@ -1,0 +1,1616 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>مصروفي</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  <script>
+/* MASROFI_STANDALONE_LOCAL_API */
+(function () {
+  const STORAGE_KEY = 'masrofi_standalone_data_v1';
+  const defaultData = {
+    settings: { tryPerUsd: 35, dailyLimitUsd: 10, lastRateSync: null },
+    savingsVault: { manualSavedUsd: 0, lastSettledDay: null },
+    incomes: [],
+    expenses: [],
+    debts: []
+  };
+
+  function normalize(raw) {
+    const r = (raw && typeof raw === 'object') ? raw : {};
+    return {
+      settings: {
+        tryPerUsd: Number(r.settings?.tryPerUsd) > 0 ? Number(r.settings.tryPerUsd) : 35,
+        dailyLimitUsd: Number(r.settings?.dailyLimitUsd) >= 0 ? Number(r.settings.dailyLimitUsd) : 10,
+        lastRateSync: r.settings?.lastRateSync || null
+      },
+      savingsVault: {
+        manualSavedUsd: Number(r.savingsVault?.manualSavedUsd) || 0,
+        lastSettledDay: r.savingsVault?.lastSettledDay || null
+      },
+      incomes: Array.isArray(r.incomes) ? r.incomes : [],
+      expenses: Array.isArray(r.expenses) ? r.expenses : [],
+      debts: Array.isArray(r.debts) ? r.debts : []
+    };
+  }
+
+  function loadData() {
+    try {
+      const txt = window.localStorage.getItem(STORAGE_KEY);
+      if (!txt) {
+        const init = normalize(defaultData);
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(init));
+        return init;
+      }
+      return normalize(JSON.parse(txt));
+    } catch (_) {
+      return normalize(defaultData);
+    }
+  }
+
+  function saveData(d) {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(normalize(d)));
+    } catch (_) {}
+  }
+
+  function normalizeDateIso(dateStr) {
+    if (typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim())) {
+      const [y, m, d] = dateStr.trim().split('-').map(Number);
+      const dt = new Date(y, m - 1, d, 12, 0, 0);
+      if (!Number.isNaN(dt.getTime())) return dt.toISOString();
+    }
+    return new Date().toISOString();
+  }
+
+  function toUsd(amount, currency, rate) {
+    const n = Number(amount) || 0;
+    if (currency === 'USD') return n;
+    return rate > 0 ? n / rate : 0;
+  }
+
+  function getDayKey(dateInput) {
+    const d = new Date(dateInput);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function computeVault(data) {
+    const rate = data.settings.tryPerUsd;
+    const dailyLimit = data.settings.dailyLimitUsd;
+    const todayKey = getDayKey(new Date());
+    const byDay = {};
+    for (const exp of data.expenses) {
+      const key = getDayKey(exp.createdAt);
+      byDay[key] = (byDay[key] || 0) + toUsd(exp.amount, exp.currency, rate);
+    }
+    let pastDaysNetUsd = 0;
+    if (dailyLimit > 0) {
+      for (const [key, spentUsd] of Object.entries(byDay)) {
+        if (key < todayKey) pastDaysNetUsd += dailyLimit - spentUsd;
+      }
+    }
+    const totalVaultUsd = Number((data.savingsVault.manualSavedUsd + pastDaysNetUsd).toFixed(2));
+    const totalVaultTry = Number((totalVaultUsd * rate).toFixed(0));
+    return {
+      manualSavedUsd: Number(data.savingsVault.manualSavedUsd.toFixed(2)),
+      pastDaysNetUsd: Number(pastDaysNetUsd.toFixed(2)),
+      totalVaultUsd,
+      totalVaultTry
+    };
+  }
+
+  function jsonResp(payload, status = 200) {
+    return Promise.resolve(new Response(JSON.stringify(payload), {
+      status,
+      headers: { 'Content-Type': 'application/json; charset=utf-8' }
+    }));
+  }
+
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async function (input, init = {}) {
+    const rawUrl = typeof input === 'string' ? input : (input && input.url) || '';
+    let pathname = rawUrl;
+    try {
+      pathname = new URL(rawUrl, window.location.origin).pathname;
+    } catch (_) {
+      pathname = rawUrl.split('?')[0];
+    }
+
+    if (!pathname.startsWith('/api/')) {
+      return origFetch(input, init);
+    }
+
+    const method = (init.method || (input && input.method) || 'GET').toUpperCase();
+    let body = {};
+    if (init.body) {
+      try { body = typeof init.body === 'string' ? JSON.parse(init.body) : init.body; } catch (_) { body = {}; }
+    }
+
+    const data = loadData();
+
+    if (pathname === '/api/data' || pathname === '/api/state') {
+      return jsonResp({ ...data, vaultSummary: computeVault(data) });
+    }
+
+    if (pathname === '/api/settings' && method === 'POST') {
+      if (body.tryPerUsd !== undefined && Number(body.tryPerUsd) > 0) {
+        data.settings.tryPerUsd = Number(body.tryPerUsd);
+      }
+      if (body.dailyLimitUsd !== undefined && Number(body.dailyLimitUsd) >= 0) {
+        data.settings.dailyLimitUsd = Number(body.dailyLimitUsd);
+      }
+      saveData(data);
+      return jsonResp({ success: true, settings: data.settings, vaultSummary: computeVault(data) });
+    }
+
+    if (pathname === '/api/settings/sync-rate' && method === 'POST') {
+      try {
+        const r = await origFetch('https://open.er-api.com/v6/latest/USD');
+        if (r.ok) {
+          const j = await r.json();
+          const rate = Number(j?.rates?.TRY);
+          if (rate && Number.isFinite(rate) && rate > 0) {
+            data.settings.tryPerUsd = Number(rate.toFixed(2));
+            data.settings.lastRateSync = new Date().toISOString();
+            saveData(data);
+            return jsonResp({
+              success: true,
+              updated: true,
+              tryPerUsd: data.settings.tryPerUsd,
+              lastRateSync: data.settings.lastRateSync,
+              settings: data.settings
+            });
+          }
+        }
+      } catch (_) {}
+      return jsonResp({
+        success: true,
+        updated: false,
+        tryPerUsd: data.settings.tryPerUsd,
+        lastRateSync: data.settings.lastRateSync,
+        settings: data.settings
+      });
+    }
+
+    if (pathname === '/api/vault/adjust' && method === 'POST') {
+      const deltaUsd = Number(body.deltaUsd) || 0;
+      data.savingsVault.manualSavedUsd = Number((data.savingsVault.manualSavedUsd + deltaUsd).toFixed(2));
+      saveData(data);
+      return jsonResp({ success: true, vaultSummary: computeVault(data) });
+    }
+
+    if (pathname === '/api/incomes' && method === 'POST') {
+      const amount = Number(body.amount);
+      if (!amount || amount <= 0) return jsonResp({ success: false, error: 'مبلغ غير صالح' }, 400);
+      const newIncome = {
+        id: Date.now().toString(),
+        amount,
+        currency: body.currency === 'TRY' ? 'TRY' : 'USD',
+        note: (body.note || '').trim(),
+        createdAt: normalizeDateIso(body.date)
+      };
+      data.incomes.push(newIncome);
+      saveData(data);
+      return jsonResp({ success: true, income: newIncome });
+    }
+
+    const incomeDelMatch = pathname.match(/^\/api\/incomes\/([^/]+)$/);
+    if (incomeDelMatch && method === 'DELETE') {
+      data.incomes = data.incomes.filter((i) => i.id !== incomeDelMatch[1]);
+      saveData(data);
+      return jsonResp({ success: true });
+    }
+
+    if (pathname === '/api/expenses' && method === 'POST') {
+      const amount = Number(body.amount);
+      if (!amount || amount <= 0) return jsonResp({ success: false, error: 'مبلغ غير صالح' }, 400);
+      const newExpense = {
+        id: Date.now().toString(),
+        amount,
+        currency: body.currency === 'USD' ? 'USD' : 'TRY',
+        category: body.category || 'شخصي ومختلفات',
+        note: (body.note || '').trim(),
+        createdAt: normalizeDateIso(body.date)
+      };
+      data.expenses.push(newExpense);
+      saveData(data);
+      return jsonResp({ success: true, expense: newExpense });
+    }
+
+    const expenseDelMatch = pathname.match(/^\/api\/expenses\/([^/]+)$/);
+    if (expenseDelMatch && method === 'DELETE') {
+      data.expenses = data.expenses.filter((e) => e.id !== expenseDelMatch[1]);
+      saveData(data);
+      return jsonResp({ success: true });
+    }
+
+    if (pathname === '/api/debts' && method === 'POST') {
+      const amount = Number(body.amount);
+      const personName = (body.personName || '').trim();
+      if (!personName || !amount || amount <= 0) {
+        return jsonResp({ success: false, error: 'بيانات الدين غير مكتملة' }, 400);
+      }
+      const newDebt = {
+        id: Date.now().toString(),
+        personName,
+        amount,
+        currency: body.currency === 'TRY' ? 'TRY' : 'USD',
+        type: body.type === 'i_owe' ? 'i_owe' : 'they_owe',
+        isPaid: false,
+        note: (body.note || '').trim(),
+        createdAt: normalizeDateIso(body.date)
+      };
+      data.debts.push(newDebt);
+      saveData(data);
+      return jsonResp({ success: true, debt: newDebt });
+    }
+
+    const debtPayMatch = pathname.match(/^\/api\/debts\/([^/]+)\/pay$/);
+    if (debtPayMatch && method === 'PATCH') {
+      const debt = data.debts.find((d) => d.id === debtPayMatch[1]);
+      if (debt) {
+        debt.isPaid = !debt.isPaid;
+        saveData(data);
+      }
+      return jsonResp({ success: true });
+    }
+
+    const debtDelMatch = pathname.match(/^\/api\/debts\/([^/]+)$/);
+    if (debtDelMatch && method === 'DELETE') {
+      data.debts = data.debts.filter((d) => d.id !== debtDelMatch[1]);
+      saveData(data);
+      return jsonResp({ success: true });
+    }
+
+    return jsonResp({ success: true });
+  };
+})();
+</script>
+  <style>
+    :root {
+      --bg: #060b14;
+      --surface: #0d1626;
+      --surface-2: #132036;
+      --surface-3: #192b48;
+      --border: rgba(148, 163, 184, 0.16);
+      --border-strong: rgba(56, 189, 248, 0.36);
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --cyan: #38bdf8;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #fb7185;
+      --violet: #a78bfa;
+      --radius-lg: 18px;
+      --radius-md: 13px;
+      --radius-sm: 10px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: 'IBM Plex Sans Arabic', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    html, body {
+      min-height: 100dvh;
+    }
+
+    body {
+      background:
+        radial-gradient(circle at 12% -6%, rgba(56, 189, 248, 0.15), transparent 45%),
+        radial-gradient(circle at 90% 0%, rgba(16, 185, 129, 0.12), transparent 42%),
+        var(--bg);
+      color: var(--text);
+      max-width: 700px;
+      margin: 0 auto;
+      padding: 12px 12px 24px;
+      line-height: 1.5;
+      display: flex;
+      flex-direction: column;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 12px;
+      background: linear-gradient(135deg, rgba(19, 32, 54, 0.96), rgba(13, 22, 38, 0.96));
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      margin-bottom: 10px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .brand-badge {
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #0284c7, #10b981);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 1.1rem;
+      color: #fff;
+      flex-shrink: 0;
+    }
+
+    .brand h1 {
+      font-size: 1.12rem;
+      font-weight: 800;
+    }
+
+    .brand span {
+      display: block;
+      font-size: 0.7rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .chip-btn {
+      border: 1px solid var(--border);
+      background: var(--surface-2);
+      color: var(--text);
+      border-radius: var(--radius-sm);
+      padding: 7px 11px;
+      font-size: 0.76rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .chip-btn.gold.active {
+      background: var(--amber);
+      color: #07101d;
+      border-color: var(--amber);
+    }
+
+    .kpi-strip {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .kpi-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 9px 10px;
+      min-width: 0;
+    }
+
+    .kpi-label {
+      font-size: 0.7rem;
+      color: var(--muted);
+      margin-bottom: 2px;
+    }
+
+    .kpi-val {
+      font-size: 0.92rem;
+      font-weight: 800;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .kpi-sub {
+      font-size: 0.67rem;
+      color: var(--muted);
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .c-emerald { color: var(--emerald); }
+    .c-rose { color: var(--rose); }
+    .c-cyan { color: var(--cyan); }
+    .c-amber { color: var(--amber); }
+
+    .tabs {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 5px;
+      margin-bottom: 10px;
+    }
+
+    .tab-btn {
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      padding: 7px 6px;
+      border-radius: var(--radius-sm);
+      font-size: 0.77rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .tab-btn.active {
+      background: linear-gradient(135deg, rgba(56, 189, 248, 0.22), rgba(16, 185, 129, 0.18));
+      color: var(--text);
+      border: 1px solid var(--border-strong);
+    }
+
+    .panel {
+      display: none;
+    }
+
+    .panel.active {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+    }
+
+    .panel.active > .card:last-child {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .panel.active > .card:last-child .list-box {
+      flex: 1;
+      max-height: none;
+      min-height: 175px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .card-title {
+      font-size: 0.92rem;
+      font-weight: 800;
+    }
+
+    .badge {
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--cyan);
+      border: 1px solid var(--border);
+      font-weight: 700;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .form-grid.cols-3 {
+      grid-template-columns: 1.1fr 0.9fr 1fr;
+    }
+
+    .full {
+      grid-column: 1 / -1;
+    }
+
+    input, select {
+      width: 100%;
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 8px 10px;
+      font-size: 0.83rem;
+      outline: none;
+    }
+
+    input:focus, select:focus {
+      border-color: var(--cyan);
+    }
+
+    .btn {
+      border: none;
+      border-radius: var(--radius-sm);
+      padding: 8px 12px;
+      font-size: 0.82rem;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #0ea5e9, #10b981);
+      color: #04101c;
+    }
+
+    .btn-soft {
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-danger {
+      background: rgba(251, 113, 133, 0.14);
+      color: var(--rose);
+      border: 1px solid rgba(251, 113, 133, 0.3);
+      padding: 4px 8px;
+      font-size: 0.72rem;
+    }
+
+    .list-box {
+      max-height: 220px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .row-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 0.8rem;
+    }
+
+    .row-main {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .row-title {
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .row-meta {
+      font-size: 0.69rem;
+      color: var(--muted);
+    }
+
+    .row-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .progress-wrap {
+      height: 8px;
+      background: var(--surface-2);
+      border-radius: 999px;
+      overflow: hidden;
+      margin: 7px 0;
+      border: 1px solid var(--border);
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--emerald), var(--cyan));
+      transition: width 0.25s ease;
+    }
+
+    .empty-msg {
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.78rem;
+      padding: 12px 8px;
+    }
+
+    .privacy-blur .secret-num {
+      filter: blur(6px);
+      user-select: none;
+    }
+
+    @media (max-width: 500px) {
+      .form-grid.cols-3 {
+        grid-template-columns: 1fr 1fr;
+      }
+      .kpi-val {
+        font-size: 0.82rem;
+      }
+    }
+  </style>
+
+  <!-- MASROFI_PIN_LOCK_START -->
+  <style id="masrofi-pin-style">
+    #masrofi-pin-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 99999;
+      background: radial-gradient(circle at top, rgba(19, 36, 62, 0.98), rgba(6, 11, 20, 0.99));
+      backdrop-filter: blur(12px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      direction: rtl;
+    }
+    #masrofi-pin-modal.open {
+      display: flex;
+    }
+    .mpin-box {
+      width: 100%;
+      max-width: 356px;
+      background: linear-gradient(160deg, rgba(19, 32, 54, 0.98), rgba(11, 19, 34, 0.98));
+      border: 1px solid var(--border-strong, rgba(56, 189, 248, 0.36));
+      border-radius: 24px;
+      padding: 22px 18px;
+      text-align: center;
+      box-shadow: 0 26px 70px rgba(0, 0, 0, 0.75);
+    }
+    .mpin-lock-icon {
+      width: 44px;
+      height: 44px;
+      margin: 0 auto 10px;
+      border-radius: 14px;
+      background: rgba(56, 189, 248, 0.14);
+      border: 1px solid rgba(56, 189, 248, 0.32);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.2rem;
+      color: var(--cyan, #38bdf8);
+      font-weight: 800;
+    }
+    .mpin-title {
+      font-size: 1.12rem;
+      font-weight: 800;
+      margin-bottom: 4px;
+    }
+    .mpin-sub {
+      font-size: 0.8rem;
+      color: var(--muted, #94a3b8);
+      margin-bottom: 14px;
+    }
+    .mpin-dots {
+      display: flex;
+      justify-content: center;
+      gap: 14px;
+      margin-bottom: 10px;
+      direction: ltr;
+    }
+    .mpin-dot {
+      width: 15px;
+      height: 15px;
+      border-radius: 50%;
+      border: 2px solid var(--cyan, #38bdf8);
+      background: transparent;
+      transition: transform 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+    }
+    .mpin-dot.filled {
+      background: var(--cyan, #38bdf8);
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.65);
+      transform: scale(1.15);
+    }
+    .mpin-msg {
+      min-height: 20px;
+      font-size: 0.8rem;
+      color: var(--rose, #fb7185);
+      margin-bottom: 10px;
+      font-weight: 700;
+    }
+    .mpin-msg.ok {
+      color: var(--emerald, #10b981);
+    }
+    .mpin-pad {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      direction: ltr;
+    }
+    .mpin-key {
+      height: 52px;
+      border-radius: 15px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background: rgba(25, 43, 72, 0.72);
+      color: var(--text, #f8fafc);
+      font-size: 1.18rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: transform 0.08s ease, background 0.12s ease;
+    }
+    .mpin-key:active {
+      transform: scale(0.95);
+      background: var(--cyan, #38bdf8);
+      color: #060b14;
+    }
+    .mpin-key.fn {
+      font-size: 0.8rem;
+      color: var(--amber, #f59e0b);
+    }
+    .mpin-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .mpin-link-btn {
+      flex: 1;
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border, rgba(148, 163, 184, 0.18));
+      background: rgba(19, 32, 54, 0.6);
+      color: var(--muted, #94a3b8);
+      font-size: 0.78rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+  </style>
+  <!-- MASROFI_PIN_LOCK_END -->
+<!-- MASROFI_IOS_PWA_START -->
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#09111e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="مصروفي">
+<link rel="apple-touch-icon" href="./icons/icon-192.png">
+<!-- MASROFI_IOS_PWA_END -->
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">
+      <div class="brand-badge" id="app-brand-badge">💳</div>
+      <div>
+        <h1>مصروفي</h1>
+        <span id="rate-badge">TRY: 50.62 • SYP: 13500</span>
+      </div>
+    </div>
+    <button type="button" class="chip-btn gold" id="privacy-toggle">إخفاء</button>
+  </div>
+
+  <div class="kpi-strip">
+    <div class="kpi-card">
+      <div class="kpi-label">الصافي الحالي</div>
+      <div class="kpi-val c-cyan secret-num" id="kpi-net">$0.00</div>
+      <div class="kpi-sub secret-num" id="kpi-net-sub">0 ₺ • 0 ل.س</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">مصاريف اليوم</div>
+      <div class="kpi-val c-rose secret-num" id="kpi-today">$0.00</div>
+      <div class="kpi-sub secret-num" id="kpi-limit-note">سقف: $10</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">الحصالة</div>
+      <div class="kpi-val c-emerald secret-num" id="kpi-vault">$0.00</div>
+      <div class="kpi-sub secret-num" id="kpi-vault-sub">0 ₺ • 0 ل.س</div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button type="button" class="tab-btn active" data-tab="overview">الرئيسية</button>
+    <button type="button" class="tab-btn" data-tab="tx">الدخل والمصروف</button>
+    <button type="button" class="tab-btn" data-tab="debts">الديون والحصالة</button>
+    <button type="button" class="tab-btn" data-tab="settings">الإعدادات</button>
+  </div>
+
+  <section class="panel active" id="panel-overview">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">إضافة سريعة</div>
+        <span class="badge" id="today-status-badge">0% من السقف</span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-bar" id="daily-progress"></div>
+      </div>
+      <form id="quick-add-form" class="form-grid cols-3">
+        <select id="q-type">
+          <option value="expense">مصروف (-)</option>
+          <option value="income">دخل (+)</option>
+        </select>
+        <input type="number" step="any" id="q-amount" placeholder="المبلغ" required />
+        <select id="q-currency">
+          <option value="USD">دولار (USD $)</option>
+          <option value="TRY">تركي (TRY ₺)</option>
+          <option value="SYP">سوري (SYP ل.س)</option>
+        </select>
+        <input type="text" id="q-note" class="full" placeholder="ملاحظة مختصرة (مثال: مواصلات، غداء، راتب...)" />
+        <button type="submit" class="btn btn-primary full">حفظ العملية</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">أحدث الحركات</div>
+        <span class="badge" id="recent-count">0</span>
+      </div>
+      <div class="list-box" id="recent-list"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-tx">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">إجمالي الدخل والمصاريف</div>
+        <span class="badge secret-num" id="tx-totals-badge">دخل: $0 | مصروف: $0</span>
+      </div>
+      <div class="form-grid">
+        <input type="date" id="tx-date" />
+        <select id="tx-filter">
+          <option value="all">الكل</option>
+          <option value="expense">المصاريف فقط</option>
+          <option value="income">الدخل فقط</option>
+        </select>
+      </div>
+      <div class="list-box" id="all-tx-list"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-debts">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">حصالة التوفير</div>
+        <span class="badge c-emerald secret-num" id="vault-badge">$0.00</span>
+      </div>
+      <form id="vault-form" class="form-grid cols-3">
+        <input type="number" step="any" id="v-amount" placeholder="مبلغ الإيداع" required />
+        <select id="v-currency">
+          <option value="USD">دولار (USD $)</option>
+          <option value="TRY">تركي (TRY ₺)</option>
+          <option value="SYP">سوري (SYP ل.س)</option>
+        </select>
+        <button type="submit" class="btn btn-primary">إيداع</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">الديون</div>
+        <span class="badge c-amber secret-num" id="debts-badge">$0.00</span>
+      </div>
+      <form id="debt-form" class="form-grid">
+        <input type="text" id="d-person" placeholder="اسم الشخص أو الجهة" required />
+        <input type="number" step="any" id="d-amount" placeholder="المبلغ" required />
+        <select id="d-dir">
+          <option value="owed_to_me">لي (مستحق لي)</option>
+          <option value="i_owe">عليّ (مستحق عليّ)</option>
+        </select>
+        <select id="d-currency">
+          <option value="USD">دولار (USD $)</option>
+          <option value="TRY">تركي (TRY ₺)</option>
+          <option value="SYP">سوري (SYP ل.س)</option>
+        </select>
+        <button type="submit" class="btn btn-primary full">إضافة دين</button>
+      </form>
+      <div class="list-box" id="debts-list"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-settings">
+
+    <div class="card" id="accent-theme-card">
+      <div class="card-head">
+        <div class="card-title">لون التمييز الرئيسي</div>
+        <span class="badge" id="accent-current-label">سماوي</span>
+      </div>
+      <div class="row-meta" style="margin-bottom:8px;">اختر لون اللمسات الرئيسية للتطبيق ليتناسب مع ذوقك.</div>
+      <div class="form-grid" id="accent-choices" style="grid-template-columns: repeat(2, 1fr);">
+        <button type="button" class="btn btn-soft" data-accent="cyan" data-label="سماوي">سماوي (#38bdf8)</button>
+        <button type="button" class="btn btn-soft" data-accent="emerald" data-label="زمردي (#10b981)">زمردي (#10b981)</button>
+        <button type="button" class="btn btn-soft" data-accent="violet" data-label="بنفسجي (#a78bfa)">بنفسجي (#a78bfa)</button>
+        <button type="button" class="btn btn-soft" data-accent="amber" data-label="كهرماني (#f59e0b)">كهرماني (#f59e0b)</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">أمان التطبيق ورمز PIN</div>
+        <span class="badge">من الداخل فقط</span>
+      </div>
+      <div class="row-meta" style="margin-bottom:8px;">تغيير رمز الـ PIN المكون من 4 أرقام متاح من داخل الإعدادات فقط بعد التحقق من الرمز الحالي.</div>
+      <button type="button" class="btn btn-soft full" id="masrofi-change-pin-btn">تغيير رمز PIN (4 أرقام)</button>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">أسعار الصرف والسقف اليومي</div>
+        <button type="button" class="chip-btn" id="sync-rates-btn">تحديث مباشر</button>
+      </div>
+      <div class="row-meta" id="rates-sync-status" style="margin-bottom:8px;">يتحدث تلقائياً عند توفر الإنترنت</div>
+      <form id="settings-form" class="form-grid">
+        <div>
+          <label class="row-meta">سعر الدولار بالتركي (TRY)</label>
+          <input type="number" step="any" id="s-try-rate" required />
+        </div>
+        <div>
+          <label class="row-meta">سعر الدولار بالسوري (SYP)</label>
+          <input type="number" step="any" id="s-syp-rate" required />
+        </div>
+        <div class="full">
+          <label class="row-meta">السقف اليومي للمصاريف ($)</label>
+          <input type="number" step="any" id="s-limit" required />
+        </div>
+        <button type="submit" class="btn btn-primary full">حفظ الإعدادات</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">نسخة احتياطية للبيانات</div>
+      </div>
+      <div class="form-grid">
+        <button type="button" class="btn btn-soft" id="export-btn">تصدير JSON</button>
+        <button type="button" class="btn btn-soft" id="import-trigger">استيراد JSON</button>
+        <input type="file" id="import-file" accept=".json,application/json" style="display:none;" />
+      </div>
+    </div>
+  </section>
+
+  <script>
+  (function () {
+    const STORAGE_KEY = 'masrofi_standalone_data_v1';
+    const PRIV_KEY = 'masrofi_privacy_mode_v1';
+    let privacyHidden = false;
+    try { privacyHidden = window.localStorage.getItem(PRIV_KEY) === '1'; } catch (_) {}
+
+    function readStore() {
+      try {
+        const raw = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '{}');
+        const tryRate = Number(raw.settings?.tryPerUsd) > 0 ? Number(raw.settings.tryPerUsd) : 50.62;
+        const sypRate = Number(raw.settings?.sypPerUsd) > 0 ? Number(raw.settings.sypPerUsd) : 13500;
+        return {
+          settings: {
+            tryPerUsd: tryRate,
+            sypPerUsd: sypRate,
+            dailyLimitUsd: Number(raw.settings?.dailyLimitUsd) >= 0 ? Number(raw.settings.dailyLimitUsd) : 10,
+            lastRateSync: raw.settings?.lastRateSync || null
+          },
+          savingsVault: {
+            manualSavedUsd: Number(raw.savingsVault?.manualSavedUsd) || 0,
+            lastSettledDay: raw.savingsVault?.lastSettledDay || null
+          },
+          incomes: Array.isArray(raw.incomes) ? raw.incomes : [],
+          expenses: Array.isArray(raw.expenses) ? raw.expenses : [],
+          debts: Array.isArray(raw.debts) ? raw.debts : []
+        };
+      } catch (_) {
+        return {
+          settings: { tryPerUsd: 50.62, sypPerUsd: 13500, dailyLimitUsd: 10, lastRateSync: null },
+          savingsVault: { manualSavedUsd: 0, lastSettledDay: null },
+          incomes: [], expenses: [], debts: []
+        };
+      }
+    }
+
+    function writeStore(data, shouldRender = true) {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      if (shouldRender) renderAll();
+    }
+
+    function toUsd(amt, cur, settings) {
+      const n = Number(amt) || 0;
+      if (cur === 'USD') return n;
+      if (cur === 'TRY') return settings.tryPerUsd > 0 ? n / settings.tryPerUsd : 0;
+      if (cur === 'SYP') return settings.sypPerUsd > 0 ? n / settings.sypPerUsd : 0;
+      return n;
+    }
+
+    function fmtUsd(n) {
+      return '$' + Number(n || 0).toFixed(2);
+    }
+
+    function fmtAmountByCurrency(usdVal, cur, settings) {
+      const n = Number(usdVal) || 0;
+      if (cur === 'TRY') return Math.round(n * settings.tryPerUsd).toLocaleString('en-US') + ' ₺';
+      if (cur === 'SYP') return Math.round(n * settings.sypPerUsd).toLocaleString('en-US') + ' ل.س';
+      return fmtUsd(n);
+    }
+
+    function formatSingleEntry(amount, currency, settings) {
+      const val = Number(amount) || 0;
+      if (currency === 'TRY') return val.toLocaleString('en-US') + ' ₺';
+      if (currency === 'SYP') return val.toLocaleString('en-US') + ' ل.س';
+      return fmtUsd(val);
+    }
+
+    function dayKey(iso) {
+      const d = new Date(iso || Date.now());
+      if (Number.isNaN(d.getTime())) return '';
+      return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+
+    function renderAll() {
+      const d = readStore();
+      const s = d.settings;
+      const today = dayKey(new Date().toISOString());
+
+      document.body.classList.toggle('privacy-blur', privacyHidden);
+      const privBtn = document.getElementById('privacy-toggle');
+      privBtn.textContent = privacyHidden ? 'إظهار' : 'إخفاء';
+      privBtn.classList.toggle('active', privacyHidden);
+
+      document.getElementById('rate-badge').textContent = `TRY: ${s.tryPerUsd} • SYP: ${Math.round(s.sypPerUsd).toLocaleString('en-US')}`;
+      document.getElementById('s-try-rate').value = s.tryPerUsd;
+      document.getElementById('s-syp-rate').value = s.sypPerUsd;
+      document.getElementById('s-limit').value = s.dailyLimitUsd;
+      document.getElementById('kpi-limit-note').textContent = `سقف: $${s.dailyLimitUsd}`;
+
+      const syncEl = document.getElementById('rates-sync-status');
+      if (s.lastRateSync) {
+        const dt = new Date(s.lastRateSync);
+        syncEl.textContent = 'آخر تحديث مباشر: ' + (Number.isNaN(dt.getTime()) ? s.lastRateSync : dt.toLocaleString('ar-SY'));
+      }
+
+      const incUsd = d.incomes.reduce((acc, x) => acc + toUsd(x.amount, x.currency, s), 0);
+      const expUsd = d.expenses.reduce((acc, x) => acc + toUsd(x.amount, x.currency, s), 0);
+      const todayExpUsd = d.expenses
+        .filter((x) => dayKey(x.createdAt) === today)
+        .reduce((acc, x) => acc + toUsd(x.amount, x.currency, s), 0);
+
+      const vaultUsd = Number(d.savingsVault.manualSavedUsd || 0);
+      const netUsd = incUsd - expUsd - vaultUsd;
+
+      document.getElementById('kpi-net').textContent = fmtUsd(netUsd);
+      document.getElementById('kpi-net-sub').textContent = `${fmtAmountByCurrency(netUsd, 'TRY', s)} • ${fmtAmountByCurrency(netUsd, 'SYP', s)}`;
+      document.getElementById('kpi-today').textContent = fmtUsd(todayExpUsd);
+      document.getElementById('kpi-vault').textContent = fmtUsd(vaultUsd);
+      document.getElementById('kpi-vault-sub').textContent = `${fmtAmountByCurrency(vaultUsd, 'TRY', s)} • ${fmtAmountByCurrency(vaultUsd, 'SYP', s)}`;
+      document.getElementById('vault-badge').textContent = fmtUsd(vaultUsd);
+      document.getElementById('tx-totals-badge').textContent = `دخل: ${fmtUsd(incUsd)} | مصروف: ${fmtUsd(expUsd)}`;
+
+      const pct = s.dailyLimitUsd > 0 ? Math.min(100, Math.round((todayExpUsd / s.dailyLimitUsd) * 100)) : 0;
+      const bar = document.getElementById('daily-progress');
+      bar.style.width = pct + '%';
+      const statusBadge = document.getElementById('today-status-badge');
+      if (s.dailyLimitUsd > 0 && todayExpUsd > s.dailyLimitUsd) {
+        bar.style.background = 'linear-gradient(90deg, #f59e0b, #fb7185)';
+        statusBadge.textContent = 'تجاوز السقف';
+        statusBadge.style.color = '#fb7185';
+      } else {
+        bar.style.background = 'linear-gradient(90deg, #10b981, #38bdf8)';
+        statusBadge.textContent = `${pct}% من السقف`;
+        statusBadge.style.color = '#10b981';
+      }
+
+      const combined = [
+        ...d.expenses.map((x) => ({ ...x, kind: 'expense' })),
+        ...d.incomes.map((x) => ({ ...x, kind: 'income' }))
+      ].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+      document.getElementById('recent-count').textContent = String(combined.length);
+      const recentEl = document.getElementById('recent-list');
+      if (!combined.length) {
+        recentEl.innerHTML = '<div class="empty-msg">لا توجد حركات بعد</div>';
+      } else {
+        recentEl.innerHTML = combined.slice(0, 7).map((item) => {
+          const isExp = item.kind === 'expense';
+          return `<div class="row-item">
+            <div class="row-main">
+              <div class="row-title">${escapeHtml(item.note || (isExp ? 'مصروف' : 'دخل'))}</div>
+              <div class="row-meta">${dayKey(item.createdAt)}</div>
+            </div>
+            <div class="row-right">
+              <span class="secret-num ${isExp ? 'c-rose' : 'c-emerald'}" style="font-weight:800;">${isExp ? '-' : '+'}${formatSingleEntry(item.amount, item.currency, s)}</span>
+              <button type="button" class="btn btn-danger" onclick="window.__delTx('${item.kind}', '${item.id}')">حذف</button>
+            </div>
+          </div>`;
+        }).join('');
+      }
+
+      const filterVal = document.getElementById('tx-filter').value;
+      const dateVal = document.getElementById('tx-date').value;
+      const filtered = combined.filter((x) => {
+        if (filterVal !== 'all' && x.kind !== filterVal) return false;
+        if (dateVal && dayKey(x.createdAt) !== dateVal) return false;
+        return true;
+      });
+      const allTxEl = document.getElementById('all-tx-list');
+      if (!filtered.length) {
+        allTxEl.innerHTML = '<div class="empty-msg">لا توجد نتائج مطابقة</div>';
+      } else {
+        allTxEl.innerHTML = filtered.map((item) => {
+          const isExp = item.kind === 'expense';
+          return `<div class="row-item">
+            <div class="row-main">
+              <div class="row-title">${escapeHtml(item.note || (isExp ? 'مصروف' : 'دخل'))}</div>
+              <div class="row-meta">${dayKey(item.createdAt)} • ${isExp ? 'مصروف' : 'دخل'}</div>
+            </div>
+            <div class="row-right">
+              <span class="secret-num ${isExp ? 'c-rose' : 'c-emerald'}" style="font-weight:800;">${isExp ? '-' : '+'}${formatSingleEntry(item.amount, item.currency, s)}</span>
+              <button type="button" class="btn btn-danger" onclick="window.__delTx('${item.kind}', '${item.id}')">حذف</button>
+            </div>
+          </div>`;
+        }).join('');
+      }
+
+      const debts = d.debts || [];
+      const debtsUsd = debts.reduce((acc, x) => acc + toUsd(x.amount, x.currency, s), 0);
+      document.getElementById('debts-badge').textContent = fmtUsd(debtsUsd);
+      const debtsEl = document.getElementById('debts-list');
+      if (!debts.length) {
+        debtsEl.innerHTML = '<div class="empty-msg">لا توجد ديون مسجلة</div>';
+      } else {
+        debtsEl.innerHTML = debts.map((item) => {
+          const isMine = item.direction === 'owed_to_me';
+          return `<div class="row-item">
+            <div class="row-main">
+              <div class="row-title">${escapeHtml(item.person || 'بدون اسم')}</div>
+              <div class="row-meta">${isMine ? 'مستحق لي' : 'مستحق عليّ'}</div>
+            </div>
+            <div class="row-right">
+              <span class="secret-num ${isMine ? 'c-emerald' : 'c-amber'}" style="font-weight:800;">${formatSingleEntry(item.amount, item.currency, s)}</span>
+              <button type="button" class="btn btn-danger" onclick="window.__delDebt('${item.id}')">حذف</button>
+            </div>
+          </div>`;
+        }).join('');
+      }
+    }
+
+    async function fetchLiveRates(manual = false) {
+      if (!navigator.onLine) return;
+      const statusEl = document.getElementById('rates-sync-status');
+      if (manual && statusEl) statusEl.textContent = 'جاري تحديث أسعار الصرف...';
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 6000);
+        const res = await fetch('https://open.er-api.com/v6/latest/USD', { signal: controller.signal });
+        clearTimeout(timer);
+        if (!res.ok) throw new Error('bad status');
+        const json = await res.json();
+        const apiTry = Number(json?.rates?.TRY);
+        const apiSyp = Number(json?.rates?.SYP);
+        if (apiTry > 0 || apiSyp > 0) {
+          const d = readStore();
+          if (apiTry > 0) d.settings.tryPerUsd = Number(apiTry.toFixed(2));
+          if (apiSyp > 0) d.settings.sypPerUsd = Math.round(apiSyp);
+          d.settings.lastRateSync = new Date().toISOString();
+          writeStore(d, true);
+        }
+      } catch (_) {
+        if (manual && statusEl) {
+          statusEl.textContent = 'تعذر الجلب التلقائي الآن؛ يمكنك إدخال السعر يدوياً.';
+        }
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s || '').replace(/[&<>"']/g, (m) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[m]));
+    }
+
+    window.__delTx = function (kind, id) {
+      const d = readStore();
+      if (kind === 'expense') d.expenses = d.expenses.filter((x) => x.id !== id);
+      else d.incomes = d.incomes.filter((x) => x.id !== id);
+      writeStore(d);
+    };
+
+    window.__delDebt = function (id) {
+      const d = readStore();
+      d.debts = d.debts.filter((x) => x.id !== id);
+      writeStore(d);
+    };
+
+    document.querySelectorAll('.tab-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
+      });
+    });
+
+    document.getElementById('privacy-toggle').addEventListener('click', () => {
+      privacyHidden = !privacyHidden;
+      try { window.localStorage.setItem(PRIV_KEY, privacyHidden ? '1' : '0'); } catch (_) {}
+      renderAll();
+    });
+
+    document.getElementById('quick-add-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const type = document.getElementById('q-type').value;
+      const amount = Number(document.getElementById('q-amount').value);
+      const currency = document.getElementById('q-currency').value;
+      const note = document.getElementById('q-note').value.trim();
+      if (!(amount > 0)) return;
+      const d = readStore();
+      const entry = {
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        amount, currency, note, createdAt: new Date().toISOString()
+      };
+      if (type === 'expense') d.expenses.push(entry);
+      else d.incomes.push(entry);
+      document.getElementById('q-amount').value = '';
+      document.getElementById('q-note').value = '';
+      writeStore(d);
+    });
+
+    document.getElementById('vault-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const amt = Number(document.getElementById('v-amount').value);
+      const cur = document.getElementById('v-currency').value;
+      if (!(amt > 0)) return;
+      const d = readStore();
+      d.savingsVault.manualSavedUsd = Number((Number(d.savingsVault.manualSavedUsd || 0) + toUsd(amt, cur, d.settings)).toFixed(2));
+      document.getElementById('v-amount').value = '';
+      writeStore(d);
+    });
+
+    document.getElementById('debt-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const person = document.getElementById('d-person').value.trim();
+      const amount = Number(document.getElementById('d-amount').value);
+      const direction = document.getElementById('d-dir').value;
+      const currency = document.getElementById('d-currency').value;
+      if (!person || !(amount > 0)) return;
+      const d = readStore();
+      d.debts.push({
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        person, amount, direction, currency, createdAt: new Date().toISOString()
+      });
+      document.getElementById('d-person').value = '';
+      document.getElementById('d-amount').value = '';
+      writeStore(d);
+    });
+
+    document.getElementById('settings-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const tryRate = Number(document.getElementById('s-try-rate').value);
+      const sypRate = Number(document.getElementById('s-syp-rate').value);
+      const limit = Number(document.getElementById('s-limit').value);
+      const d = readStore();
+      if (tryRate > 0) d.settings.tryPerUsd = tryRate;
+      if (sypRate > 0) d.settings.sypPerUsd = sypRate;
+      if (limit >= 0) d.settings.dailyLimitUsd = limit;
+      writeStore(d);
+    });
+
+    document.getElementById('sync-rates-btn').addEventListener('click', () => fetchLiveRates(true));
+    window.addEventListener('online', () => fetchLiveRates(false));
+    document.getElementById('tx-filter').addEventListener('change', renderAll);
+    document.getElementById('tx-date').addEventListener('change', renderAll);
+
+    document.getElementById('export-btn').addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(readStore(), null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'masrofi-backup.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    document.getElementById('import-trigger').addEventListener('click', () => {
+      document.getElementById('import-file').click();
+    });
+
+    document.getElementById('import-file').addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const parsed = JSON.parse(String(reader.result || '{}'));
+          writeStore({
+            settings: {
+              tryPerUsd: Number(parsed.settings?.tryPerUsd) > 0 ? Number(parsed.settings.tryPerUsd) : 50.62,
+              sypPerUsd: Number(parsed.settings?.sypPerUsd) > 0 ? Number(parsed.settings.sypPerUsd) : 13500,
+              dailyLimitUsd: Number(parsed.settings?.dailyLimitUsd) >= 0 ? Number(parsed.settings.dailyLimitUsd) : 10,
+              lastRateSync: parsed.settings?.lastRateSync || null
+            },
+            savingsVault: {
+              manualSavedUsd: Number(parsed.savingsVault?.manualSavedUsd) || 0,
+              lastSettledDay: parsed.savingsVault?.lastSettledDay || null
+            },
+            incomes: Array.isArray(parsed.incomes) ? parsed.incomes : [],
+            expenses: Array.isArray(parsed.expenses) ? parsed.expenses : [],
+            debts: Array.isArray(parsed.debts) ? parsed.debts : []
+          });
+        } catch (_) {}
+      };
+      reader.readAsText(file);
+    });
+
+    renderAll();
+    fetchLiveRates(false);
+  })();
+  </script>
+
+  <!-- MASROFI_PIN_LOCK_START -->
+  <div id="masrofi-pin-modal" aria-modal="true" role="dialog">
+    <div class="mpin-box">
+      <div class="mpin-lock-icon">PIN</div>
+      <div class="mpin-title" id="mpin-title">رمز الدخول</div>
+      <div class="mpin-sub" id="mpin-sub">أدخل رمز الـ PIN المكون من 4 أرقام</div>
+      <div class="mpin-dots" id="mpin-dots">
+        <span class="mpin-dot"></span>
+        <span class="mpin-dot"></span>
+        <span class="mpin-dot"></span>
+        <span class="mpin-dot"></span>
+      </div>
+      <div class="mpin-msg" id="mpin-msg"></div>
+      <div class="mpin-pad" id="mpin-pad">
+        <button type="button" class="mpin-key" data-digit="1">1</button>
+        <button type="button" class="mpin-key" data-digit="2">2</button>
+        <button type="button" class="mpin-key" data-digit="3">3</button>
+        <button type="button" class="mpin-key" data-digit="4">4</button>
+        <button type="button" class="mpin-key" data-digit="5">5</button>
+        <button type="button" class="mpin-key" data-digit="6">6</button>
+        <button type="button" class="mpin-key" data-digit="7">7</button>
+        <button type="button" class="mpin-key" data-digit="8">8</button>
+        <button type="button" class="mpin-key" data-digit="9">9</button>
+        <button type="button" class="mpin-key fn" data-action="clear">مسح</button>
+        <button type="button" class="mpin-key" data-digit="0">0</button>
+        <button type="button" class="mpin-key fn" data-action="back">حذف</button>
+      </div>
+      <div class="mpin-actions">
+        <button type="button" class="mpin-link-btn" id="mpin-cancel-btn" style="display:none;">إلغاء</button>
+      </div>
+    </div>
+  </div>
+
+  <script id="masrofi-pin-script">
+  (function () {
+    const PIN_KEY = 'masrofi_user_pin_v1';
+    let currentInput = '';
+    let mode = 'unlock';
+    let pendingPin = '';
+    let allowCancel = false;
+    let busy = false;
+
+    const modal = document.getElementById('masrofi-pin-modal');
+    const titleEl = document.getElementById('mpin-title');
+    const subEl = document.getElementById('mpin-sub');
+    const msgEl = document.getElementById('mpin-msg');
+    const dots = Array.from(document.querySelectorAll('#mpin-dots .mpin-dot'));
+    const cancelBtn = document.getElementById('mpin-cancel-btn');
+
+    function getSavedPin() {
+      try {
+        const v = window.localStorage.getItem(PIN_KEY);
+        return v && /^\d{4}$/.test(v) ? v : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function setSavedPin(pin) {
+      try {
+        window.localStorage.setItem(PIN_KEY, pin);
+      } catch (_) {}
+    }
+
+    function renderDots() {
+      dots.forEach((dot, idx) => dot.classList.toggle('filled', idx < currentInput.length));
+    }
+
+    function setMsg(text, isOk = false) {
+      msgEl.textContent = text || '';
+      msgEl.classList.toggle('ok', Boolean(isOk));
+    }
+
+    function openModal(nextMode, canCancel = false, customMsg = '', isOk = false, keepPending = false) {
+      mode = nextMode;
+      allowCancel = canCancel;
+      currentInput = '';
+      if (!keepPending) pendingPin = '';
+      busy = false;
+      renderDots();
+      setMsg(customMsg, isOk);
+      cancelBtn.style.display = canCancel ? 'inline-block' : 'none';
+
+      if (mode === 'unlock') {
+        titleEl.textContent = 'قفل التطبيق';
+        subEl.textContent = 'أدخل رمز الـ PIN المكون من 4 أرقام للفتح';
+      } else if (mode === 'setup1') {
+        titleEl.textContent = 'تعيين رمز PIN جديد';
+        subEl.textContent = 'اختر رمزاً من 4 أرقام لحماية التطبيق';
+      } else if (mode === 'setup2') {
+        titleEl.textContent = 'تأكيد رمز PIN';
+        subEl.textContent = 'أعد إدخال الرمز المكون من 4 أرقام للتأكيد';
+      } else if (mode === 'change_old') {
+        titleEl.textContent = 'تغيير رمز PIN';
+        subEl.textContent = 'أدخل الرمز الحالي (4 أرقام) أولاً';
+      } else if (mode === 'change_new1') {
+        titleEl.textContent = 'الرمز الجديد (4 أرقام)';
+        subEl.textContent = 'أدخل رمز الـ PIN الجديد المكون من 4 أرقام';
+      } else if (mode === 'change_new2') {
+        titleEl.textContent = 'تأكيد الرمز الجديد';
+        subEl.textContent = 'أعد إدخال الرمز الجديد للتأكيد';
+      }
+
+      modal.classList.add('open');
+    }
+
+    function closeModal() {
+      currentInput = '';
+      pendingPin = '';
+      busy = false;
+      renderDots();
+      setMsg('');
+      modal.classList.remove('open');
+    }
+
+    function handleCompletePin(pin) {
+      const saved = getSavedPin();
+      if (mode === 'unlock') {
+        if (pin === saved) closeModal();
+        else {
+          currentInput = '';
+          busy = false;
+          renderDots();
+          setMsg('الرمز غير صحيح، حاول مرة أخرى');
+        }
+        return;
+      }
+      if (mode === 'setup1') {
+        pendingPin = String(pin);
+        openModal('setup2', false, 'أعد كتابة الرمز لتأكيده', true, true);
+        return;
+      }
+      if (mode === 'setup2') {
+        if (String(pin) === String(pendingPin)) {
+          setSavedPin(String(pin));
+          closeModal();
+        } else {
+          openModal('setup1', false, 'الرمزان غير متطابقين، ابدأ من جديد', false, false);
+        }
+        return;
+      }
+      if (mode === 'change_old') {
+        if (pin === saved) openModal('change_new1', true, 'تم التحقق، أدخل الرمز الجديد', true, false);
+        else {
+          currentInput = '';
+          busy = false;
+          renderDots();
+          setMsg('الرمز الحالي غير صحيح');
+        }
+        return;
+      }
+      if (mode === 'change_new1') {
+        pendingPin = String(pin);
+        openModal('change_new2', true, 'أعد إدخال الرمز الجديد للتأكيد', true, true);
+        return;
+      }
+      if (mode === 'change_new2') {
+        if (String(pin) === String(pendingPin)) {
+          setSavedPin(String(pin));
+          closeModal();
+        } else {
+          openModal('change_new1', true, 'الرمزان غير متطابقين، أعد إدخال الرمز الجديد', false, false);
+        }
+      }
+    }
+
+    const changeBtn = document.getElementById('masrofi-change-pin-btn');
+    if (changeBtn) {
+      changeBtn.addEventListener('click', function () {
+        if (getSavedPin()) openModal('change_old', true);
+        else openModal('setup1', true);
+      });
+    }
+
+    document.querySelectorAll('#mpin-pad .mpin-key').forEach((key) => {
+      key.addEventListener('click', function () {
+        if (busy) return;
+        const digit = key.getAttribute('data-digit');
+        const action = key.getAttribute('data-action');
+        if (digit && currentInput.length < 4) {
+          currentInput += digit;
+          renderDots();
+          setMsg('');
+          if (currentInput.length === 4) {
+            busy = true;
+            const completed = currentInput;
+            setTimeout(() => handleCompletePin(completed), 110);
+          }
+        } else if (action === 'back') {
+          currentInput = currentInput.slice(0, -1);
+          renderDots();
+          setMsg('');
+        } else if (action === 'clear') {
+          currentInput = '';
+          renderDots();
+          setMsg('');
+        }
+      });
+    });
+
+    cancelBtn.addEventListener('click', function () {
+      if (!allowCancel) return;
+      if (mode.startsWith('change_')) closeModal();
+      else if (getSavedPin()) openModal('unlock', false);
+      else closeModal();
+    });
+
+    function enforceLockOnLaunch() {
+      const saved = getSavedPin();
+      if (!saved) openModal('setup1', false);
+      else openModal('unlock', false);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', enforceLockOnLaunch);
+    } else {
+      enforceLockOnLaunch();
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && getSavedPin() && !modal.classList.contains('open')) {
+        openModal('unlock', false);
+      }
+    });
+  })();
+  </script>
+  <!-- MASROFI_PIN_LOCK_END -->
+
+<script id="masrofi-accent-script">
+(function () {
+  const ACCENT_KEY = 'masrofi_accent_color_v1';
+  const PALETTES = {
+    cyan:    { main: '#38bdf8', border: 'rgba(56, 189, 248, 0.42)', grad: 'linear-gradient(135deg, #0284c7, #38bdf8)', label: 'سماوي' },
+    emerald: { main: '#10b981', border: 'rgba(16, 185, 129, 0.42)', grad: 'linear-gradient(135deg, #059669, #10b981)', label: 'زمردي' },
+    violet:  { main: '#a78bfa', border: 'rgba(167, 139, 250, 0.42)', grad: 'linear-gradient(135deg, #7c3aed, #a78bfa)', label: 'بنفسجي' },
+    amber:   { main: '#f59e0b', border: 'rgba(245, 158, 11, 0.42)',  grad: 'linear-gradient(135deg, #d97706, #f59e0b)', label: 'كهرماني' }
+  };
+
+  function applyAccent(key) {
+    const k = PALETTES[key] ? key : 'cyan';
+    const p = PALETTES[k];
+    document.documentElement.style.setProperty('--cyan', p.main);
+    document.documentElement.style.setProperty('--border-strong', p.border);
+
+    const badge = document.getElementById('app-brand-badge');
+    if (badge) badge.style.background = p.grad;
+
+    const lbl = document.getElementById('accent-current-label');
+    if (lbl) lbl.textContent = p.label;
+
+    document.querySelectorAll('#accent-choices [data-accent]').forEach((btn) => {
+      const active = btn.getAttribute('data-accent') === k;
+      btn.style.borderColor = active ? p.main : '';
+      btn.style.color = active ? p.main : '';
+    });
+
+    try { window.localStorage.setItem(ACCENT_KEY, k); } catch (_) {}
+  }
+
+  document.querySelectorAll('#accent-choices [data-accent]').forEach((btn) => {
+    btn.addEventListener('click', function () {
+      applyAccent(btn.getAttribute('data-accent'));
+    });
+  });
+
+  let saved = 'cyan';
+  try { saved = window.localStorage.getItem(ACCENT_KEY) || 'cyan'; } catch (_) {}
+  applyAccent(saved);
+})();
+</script>
+
+</body>
+</html>
